@@ -1,0 +1,63 @@
+# 环境变量文件（包含敏感信息）
+.env
+# 提示词文件
+*_prompt.txt
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv/
+
+# 日志文件
+logs/
+*.log
+
+# 数据库文件
+*.db
+*.sqlite3
+*.sqlite
+
+# 评估报告 / 向量缓存等生成物
+eval/report.md
+
+# 运行时数据（SQLite 库 / 向量缓存 / 心跳文件）
+data/
+
+# 临时脚本与产物
+_tmp*
+
+# 其他临时文件
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+.coverage.* 

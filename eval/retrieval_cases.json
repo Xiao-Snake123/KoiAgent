@@ -1,0 +1,10 @@
+{
+  "description": "RAG 检索评估集：验证 Top-K 检索的关键词覆盖率",
+  "cases": [
+    { "query": "蓝牙 续航", "expect_source": "tech_faq", "expect_keywords": ["蓝牙", "续航"] },
+    { "query": "Type-C 接口", "expect_source": "tech_faq", "expect_keywords": ["Type-C"] },
+    { "query": "防水 等级", "expect_source": "tech_faq", "expect_keywords": ["防水"] },
+    { "query": "发货 快递", "expect_source": "tech_faq", "expect_keywords": ["发货", "快递"] },
+    { "query": "质保 保修", "expect_source": "tech_faq", "expect_keywords": ["质保"] }
+  ]
+}

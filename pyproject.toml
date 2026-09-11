@@ -1,0 +1,5 @@
+# 工具配置（运行时依赖见 requirements.txt，开发依赖见 requirements-dev.txt）
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

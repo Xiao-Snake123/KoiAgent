@@ -1,0 +1,13 @@
+openai>=1.68.0
+websockets==13.1
+loguru==0.7.3
+python-dotenv==1.0.1
+requests==2.32.3
+# Agent 编排：LangGraph + LangChain OpenAI 兼容层
+langgraph>=0.2.60
+langchain-openai>=0.2.14
+# RAG 检索：文本切分 + 向量计算
+langchain-text-splitters>=0.3.0
+numpy>=1.24
+# MCP 协议：把能力暴露给任意 MCP 客户端（Claude Desktop / Cursor 等）
+mcp>=2.0

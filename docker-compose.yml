@@ -1,0 +1,20 @@
+version: '3'
+
+services:
+  koi-agent:
+    image: Xiao-Snake123/koi-agent:latest
+    container_name: koi-agent
+    restart: always
+    volumes:
+      - ./data:/app/data
+      - ./prompts:/app/prompts
+      - ./knowledge:/app/knowledge
+      - ./.env:/app/.env
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - koi-network
+
+networks:
+  koi-network:
+    driver: bridge
