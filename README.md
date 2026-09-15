@@ -44,6 +44,10 @@ flowchart LR
     F --> E([END])
 ```
 
+> 📚 **深入阅读**
+> - [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) —— 架构说明：模块职责、设计决策与取舍、请求全链路
+> - [`docs/INTERVIEW_QA.md`](./docs/INTERVIEW_QA.md) —— 设计问答手册：40 个高频技术问题的深度回答
+
 **技术栈**
 
 | 能力 | 实现 |
@@ -242,6 +246,9 @@ KoiAgent/
 │   └── ops/
 │       └── healthcheck.py        #   容器健康检查
 ├── main.py                       # 兼容入口（等价于 python -m koiagent）
+├── docs/                         # 设计文档
+│   ├── ARCHITECTURE.md           #   架构说明与设计决策
+│   └── INTERVIEW_QA.md           #   设计问答手册
 ├── knowledge/                    # 本地知识库（供 search_knowledge_base 检索）
 ├── prompts/                      # 专家提示词模板
 ├── eval/                         # 评估 Harness（评估集 + runner + 报告）
