@@ -5,6 +5,20 @@
 
 其中 ``search_knowledge_base`` 走 RAG 检索层（``koiagent.rag``）：
 配置 ``EMBEDDING_MODEL`` 时使用**向量检索**，否则自动降级为**关键词检索**。
+
+三个工具各自的记忆行为
+----------------------
+======================  ==================  ==========================================
+工具                     是否进工具记忆       说明
+======================  ==================  ==========================================
+``get_bargain_policy``   ✅ 缓存 + 记录       纯函数，只依赖议价轮次；策略文件支持热更新
+``search_knowledge_base``✅ 缓存 + 记录       知识库支持热更新；变更后自动让缓存失效
+``get_current_time``     ❌ 仅记录            **时间每次都在变，缓存会返回错误答案**
+======================  ==================  ==========================================
+
+> 缓存是**白名单制**（见 ``koiagent.memory.tool_memory.CACHEABLE_TOOLS``）：
+> 新工具默认不缓存，必须显式声明可缓存。这样不会因为「忘了排除某个工具」
+> 而悄悄引入错误结果。
 """
 from __future__ import annotations
 
@@ -12,7 +26,19 @@ from datetime import datetime
 
 from langchain_core.tools import tool
 
+from koiagent.agent.bargain import get_bargain_policy_store
+from koiagent.memory.manager import get_memory_manager
+from koiagent.memory.tool_memory import ToolMemory
 from koiagent.rag.knowledge import get_knowledge_base
+
+
+def _tool_memory() -> ToolMemory:
+    """获取工具记忆。
+
+    **从记忆管理器单例取**，而不是单独调 ``get_tool_memory()`` —— 否则会存在两份
+    ``ToolMemory`` 实例（管理器一份、工具一份），缓存各算各的、命中率统计也对不上。
+    """
+    return get_memory_manager().tools
 
 
 @tool
@@ -24,17 +50,15 @@ def get_bargain_policy(bargain_count: int) -> str:
     Args:
         bargain_count: 当前会话已发生的议价轮次，从 1 开始计数。
     """
-    tiers = [
-        (1, "首轮让价：幅度不超过标价的 5%，优先用赠品/包邮替代直接降价。"),
-        (2, "次轮让价：累计让价不超过标价的 10%，强调成色与稀缺性。"),
-        (3, "三轮让价：累计让价不超过标价的 15%，可给出一次性『一口价』方案。"),
-    ]
-    guidance = "已达让价上限，礼貌坚持底价，或引导买家关注其他在售商品。"
-    for threshold, text in tiers:
-        if bargain_count <= threshold:
-            guidance = text
-            break
-    return f"当前议价轮次={bargain_count}；让步策略：{guidance}"
+    args = {"bargain_count": bargain_count}
+    store = get_bargain_policy_store()
+
+    def compute() -> str:
+        # 策略文件热更新（按间隔节流，开销仅一次 stat）
+        store.maybe_reload()
+        return store.advise(bargain_count)
+
+    return _tool_memory().invoke("get_bargain_policy", args, compute)
 
 
 @tool
@@ -46,21 +70,36 @@ def search_knowledge_base(query: str) -> str:
     Args:
         query: 需要检索的关键词或买家原问题。
     """
+    args = {"query": query}
     kb = get_knowledge_base()
-    if kb.size == 0:
-        return "本地知识库为空（knowledge/ 目录下暂无文档），请依据商品描述谨慎作答，不确定时如实说明。"
 
-    hits = kb.search(query)
-    if not hits:
-        return "知识库中未检索到相关内容，请基于商品信息作答；如无把握，请如实告知买家。"
+    # ⚠️ 热更新检查必须在缓存查询**之前**：否则知识库已经改了，
+    # 但缓存里还留着旧检索结果，买家会拿到过期信息。
+    if kb.maybe_reload():
+        get_memory_manager().on_knowledge_updated()
 
-    return "\n\n".join(f"[{source}] {text}" for source, text in hits)
+    def compute() -> str:
+        if kb.size == 0:
+            return (
+                "本地知识库为空（knowledge/ 目录下暂无文档），"
+                "请依据商品描述谨慎作答，不确定时如实说明。"
+            )
+        hits = kb.search(query)
+        if not hits:
+            return "知识库中未检索到相关内容，请基于商品信息作答；如无把握，请如实告知买家。"
+        return "\n\n".join(f"[{source}] {text}" for source, text in hits)
+
+    return _tool_memory().invoke("search_knowledge_base", args, compute)
 
 
 @tool
 def get_current_time() -> str:
     """获取当前服务器时间（Asia/Shanghai）。用于回答发货时间、时效等与时间相关的问题。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 结果不进缓存（时间每次都变，缓存会回答错误的时间），
+    # 但**仍然记录调用**，便于回放与统计
+    result = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _tool_memory().record("get_current_time", {}, result, cache_hit=False)
+    return result
 
 
 # 暴露给 Agent 的工具列表

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "阶梯议价策略。按商品类别/清仓需要可自由调整，改完无需重启（默认 30 秒内自动生效）。",
+  "tiers": [
+    {
+      "max_round": 1,
+      "max_discount_pct": 5,
+      "guidance": "首轮让价：幅度不超过标价的 5%，优先用赠品/包邮替代直接降价。"
+    },
+    {
+      "max_round": 2,
+      "max_discount_pct": 10,
+      "guidance": "次轮让价：累计让价不超过标价的 10%，强调成色与稀缺性。"
+    },
+    {
+      "max_round": 3,
+      "max_discount_pct": 15,
+      "guidance": "三轮让价：累计让价不超过标价的 15%，可给出一次性『一口价』方案。"
+    }
+  ],
+  "floor_guidance": "已达让价上限，礼貌坚持底价，或引导买家关注其他在售商品。"
+}

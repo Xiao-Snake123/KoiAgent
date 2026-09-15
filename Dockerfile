@@ -56,11 +56,16 @@ COPY prompts/price_prompt_example.txt prompts/price_prompt.txt
 COPY prompts/tech_prompt_example.txt prompts/tech_prompt.txt
 COPY prompts/default_prompt_example.txt prompts/default_prompt.txt
 COPY prompts/critic_prompt_example.txt prompts/critic_prompt.txt
+COPY prompts/memory_prompt_example.txt prompts/memory_prompt.txt
+COPY prompts/memory_extract_example.txt prompts/memory_extract.txt
 
 # 复制应用代码（包结构）
 COPY koiagent/ koiagent/
 COPY main.py ./
 COPY knowledge/ knowledge/
+# 业务配置（议价策略）。不拷的话容器内会回退到内置默认策略，
+# 导致改了 config/bargain_policy.json 却不生效
+COPY config/ config/
 
 # 健康检查：worker 类容器无 HTTP 端口，用「心跳文件」探活
 HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 CMD ["python", "-m", "koiagent.ops.healthcheck"]

@@ -197,3 +197,90 @@ class ThreadReaper:
     @property
     def size(self) -> int:
         return len(self._seen)
+
+
+class AsyncRateLimiter:
+    """令牌桶限速器（异步）：控制**出站动作**的速率。
+
+    为什么需要它
+    ------------
+    项目本来只有 ``ConcurrencyLimiter``，但它管的是 **LLM 推理并发**，不是**发消息**。
+    当模型响应很快时，Agent 可能在几秒内连续发出多条消息 —— 平台侧有风控，
+    高频出站有被限制的风险。
+
+    为什么用令牌桶而不是固定间隔 sleep
+    ----------------------------------
+    固定间隔（每条都 sleep N 秒）会让**正常场景也被拖慢**。令牌桶允许**突发**：
+    桶里攒着 ``burst`` 个令牌时，前几条可以立即发出；用完后再按 ``min_interval``
+    匀速补充。这既保住了「平滑出站」，又不牺牲正常响应速度。
+
+    ``min_interval <= 0`` 时退化为**不限速**（直接放行），保持向后兼容。
+    """
+
+    def __init__(self, min_interval: float = 0.0, burst: int = 3):
+        self.min_interval = float(min_interval)
+        self.capacity = max(1, int(burst))
+        self._tokens = float(self.capacity)
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+        self._waits = 0
+        self._total_wait = 0.0
+
+    def _refill(self, now: float) -> None:
+        if self.min_interval <= 0:
+            self._tokens = float(self.capacity)
+            return
+        elapsed = max(0.0, now - self._updated)
+        self._tokens = min(self.capacity, self._tokens + elapsed / self.min_interval)
+        self._updated = now
+
+    @property
+    def enabled(self) -> bool:
+        return self.min_interval > 0
+
+    def try_acquire(self) -> float:
+        """尝试取一个令牌。
+
+        返回还需等待的秒数：``0`` 表示可以立即执行；
+        否则调用方应 ``sleep`` 该时长后**重新调用**（因为期间可能有其他人抢走令牌）。
+        """
+        if not self.enabled:
+            return 0.0
+        now = time.monotonic()
+        with self._lock:
+            self._refill(now)
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return 0.0
+            deficit = 1.0 - self._tokens
+            return deficit * self.min_interval
+
+    async def acquire(self) -> None:
+        """异步获取一个令牌（必要时等待）。"""
+        if not self.enabled:
+            return
+        waited = 0.0
+        while True:
+            delay = self.try_acquire()
+            if delay <= 0:
+                if waited > 0:
+                    self._waits += 1
+                    self._total_wait += waited
+                    logger.debug(f"[rate-limit] 出站限速等待 {waited:.2f}s 后放行")
+                return
+            # 向上取整到毫秒，避免忙等
+            await asyncio.sleep(max(0.001, delay))
+            waited += delay
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            self._refill(time.monotonic())
+            tokens = self._tokens
+        return {
+            "enabled": self.enabled,
+            "min_interval": self.min_interval,
+            "capacity": self.capacity,
+            "tokens": round(tokens, 3),
+            "throttled": self._waits,
+            "total_wait_s": round(self._total_wait, 2),
+        }

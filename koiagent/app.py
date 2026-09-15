@@ -8,7 +8,9 @@ import websockets
 from loguru import logger
 
 from koiagent.agent.graph import KoiReplyBot
-from koiagent.infra.resilience import DedupCache
+from koiagent.infra.resilience import AsyncRateLimiter, DedupCache
+from koiagent.memory.manager import get_memory_manager
+from koiagent.ops.order_events import OrderEventHandler, resolve_order_event
 from koiagent.platform.api import KoiApis
 from koiagent.platform.protocol import (
     decrypt,
@@ -21,7 +23,7 @@ from koiagent.storage.context import ChatContextManager
 
 
 class KoiLive:
-    def __init__(self, cookies_str, bot: KoiReplyBot):
+    def __init__(self, cookies_str, bot: KoiReplyBot, order_handler=None, context_manager=None):
         self.api = KoiApis()
         self.bot = bot
         self.base_url = 'wss://wss-goofish.dingtalk.com/'
@@ -30,7 +32,9 @@ class KoiLive:
         self.api.session.cookies.update(self.cookies)  # 直接使用 session.cookies.update
         self.myid = self.cookies['unb']
         self.device_id = generate_device_id(self.myid)
-        self.context_manager = ChatContextManager()
+        # 依赖注入：测试时传入临时路径的 context_manager，避免写入真实业务库
+        self.context_manager = context_manager or ChatContextManager()
+        self.memory = get_memory_manager()
         
         # 心跳相关配置
         self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "15"))  # 心跳间隔，默认15秒
@@ -69,6 +73,18 @@ class KoiLive:
         self.dedup = DedupCache(
             maxsize=int(os.getenv("DEDUP_CACHE_SIZE", "2000")),
             ttl=float(os.getenv("DEDUP_TTL", "300")),
+        )
+
+        # 出站限速：ConcurrencyLimiter 管的是 LLM 并发，管不住"模型响应快时连续发消息"
+        self.send_limiter = AsyncRateLimiter(
+            min_interval=float(os.getenv("SEND_MIN_INTERVAL", "0")),
+            burst=int(os.getenv("SEND_BURST", "3")),
+        )
+
+        # 订单事件钩子：默认做记录 + 写 Agent 记忆 + 维护画像成交数；
+        # 业务动作（催付 / 发货提醒 / 引导评价）由子类覆盖对应方法即可
+        self.order_handler = order_handler or OrderEventHandler(
+            context_manager=self.context_manager, bot=self.bot, memory=self.memory
         )
 
     async def refresh_token(self):
@@ -418,25 +434,20 @@ class KoiLive:
                 logger.error(f"消息解密失败: {e}")
                 return
 
+            # 订单状态变化 → 交给可插拔的订单事件钩子处理
+            # （默认实现只做幂等记录；催付/发货提醒等有副作用的动作留给子类）
             try:
-                # 判断是否为订单消息,需要自行编写付款后的逻辑
-                if message['3']['redReminder'] == '等待买家付款':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'等待买家 {user_url} 付款')
+                # 单聊场景下会话 ID 与对方用户 ID 一致；若平台改为群聊需另行解析
+                order_user_id = message['1'].split('@')[0]
+                order_event = resolve_order_event(
+                    message['3']['redReminder'],
+                    user_id=order_user_id,
+                    chat_id=order_user_id,
+                )
+                if order_event is not None:
+                    self.order_handler.handle(order_event)
                     return
-                elif message['3']['redReminder'] == '交易关闭':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'买家 {user_url} 交易关闭')
-                    return
-                elif message['3']['redReminder'] == '等待卖家发货':
-                    user_id = message['1'].split('@')[0]
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
-                    logger.info(f'交易成功 {user_url} 等待卖家发货')
-                    return
-
-            except:
+            except (KeyError, TypeError, IndexError, AttributeError):
                 pass
 
             # 判断消息类型
@@ -530,11 +541,13 @@ class KoiLive:
             # 获取完整的对话上下文
             context = self.context_manager.get_context_by_chat(chat_id)
             # 生成回复（异步非阻塞，避免阻塞事件循环）
+            # user_id 传入后可支撑「用户画像」：同一买家跨会话积累偏好与预算
             bot_reply = await self.bot.agenerate_reply(
                 send_message,
                 item_description,
                 context=context,
-                chat_id=chat_id
+                chat_id=chat_id,
+                user_id=send_user_id,
             )
             
             # 检查是否需要回复
@@ -568,6 +581,8 @@ class KoiLive:
                 logger.info(f"模拟人工输入，延迟发送 {total_delay:.2f} 秒...")
                 await asyncio.sleep(total_delay)
                 
+            # 出站限速：模型响应快时可能连续发消息，有被平台风控的风险
+            await self.send_limiter.acquire()
             await self.send_msg(websocket, chat_id, send_user_id, bot_reply)
             
         except Exception as e:

@@ -131,6 +131,10 @@ class TraceRecord:
     reflections: int = 0
     degraded: bool = False
     error: str = ""
+    # ---- 记忆系统 ----
+    memory_facts: int = 0       # 本轮召回的长期记忆条数
+    profile_hit: bool = False   # 是否命中用户画像
+    summary_len: int = 0        # 短期记忆摘要长度（>0 表示该会话已有摘要）
 
 
 def _percentile(values: List[float], pct: float) -> float:
@@ -152,6 +156,11 @@ class Tracer:
         self.trace_path = os.path.join(self.trace_dir, "traces.jsonl")
         self.metrics_path = os.path.join(self.trace_dir, "metrics.json")
         self.sample_limit = int(os.getenv("METRICS_SAMPLE_LIMIT", "1000"))
+
+        # 追踪文件轮转：长跑进程若不轮转，traces.jsonl 会持续增长直到写满磁盘。
+        # 写失败被 record() 吞掉后不会告警，于是磁盘满会变成「静默失效」，因此必须轮转。
+        self.trace_max_bytes = int(os.getenv("TRACE_MAX_BYTES", str(10 * 1024 * 1024)))
+        self.trace_backup_count = max(0, int(os.getenv("TRACE_BACKUP_COUNT", "5")))
 
         self._lock = threading.Lock()
         self._langfuse_handler: Optional[Any] = None
@@ -194,8 +203,54 @@ class Tracer:
             except Exception as e:  # 可观测性失败绝不能影响主流程
                 logger.warning(f"写入追踪数据失败: {e}")
 
+    def _rotate_if_needed(self) -> None:
+        """按大小轮转 ``traces.jsonl``：``traces.jsonl.1`` … ``traces.jsonl.N``。
+
+        轮转在**写入前**检查，避免单次写入后文件越界过大而无法回收。
+        ``trace_backup_count`` 为 0 时表示只截断不备份（保留当前文件）。
+        """
+        if self.trace_max_bytes <= 0 or not os.path.exists(self.trace_path):
+            return
+        try:
+            if os.path.getsize(self.trace_path) < self.trace_max_bytes:
+                return
+        except OSError:
+            return
+
+        if self.trace_backup_count == 0:
+            # 不保留历史：直接清空当前文件
+            open(self.trace_path, "w", encoding="utf-8").close()
+            logger.debug(f"追踪文件已达上限，已清空: {self.trace_path}")
+            return
+
+        # 从最旧的备份开始顺移，丢弃超出 backup_count 的那份
+        oldest = f"{self.trace_path}.{self.trace_backup_count}"
+        if os.path.exists(oldest):
+            try:
+                os.remove(oldest)
+            except OSError as e:
+                logger.debug(f"删除最旧追踪备份失败 {oldest}: {e}")
+
+        for idx in range(self.trace_backup_count - 1, 0, -1):
+            src = f"{self.trace_path}.{idx}"
+            if os.path.exists(src):
+                try:
+                    os.replace(src, f"{self.trace_path}.{idx + 1}")
+                except OSError as e:
+                    logger.debug(f"轮转追踪备份失败 {src}: {e}")
+
+        try:
+            os.replace(self.trace_path, f"{self.trace_path}.1")
+            logger.info(
+                f"追踪文件已轮转: {os.path.basename(self.trace_path)} -> "
+                f"{os.path.basename(self.trace_path)}.1（上限 {self.trace_max_bytes} 字节）"
+            )
+        except OSError as e:
+            logger.warning(f"追踪文件轮转失败，将追加写入: {e}")
+
     def _append_trace(self, rec: TraceRecord) -> None:
         os.makedirs(self.trace_dir, exist_ok=True)
+        self._rotate_if_needed()
         with open(self.trace_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
 
@@ -208,6 +263,9 @@ class Tracer:
                 data.setdefault("guard_blocked", 0)
                 data.setdefault("degraded", 0)
                 data.setdefault("critic_rejections", 0)
+                data.setdefault("memory_facts", 0)
+                data.setdefault("profile_hits", 0)
+                data.setdefault("summaries", 0)
                 return data
         except Exception as e:
             logger.warning(f"读取指标文件失败，将重新统计: {e}")
@@ -218,6 +276,9 @@ class Tracer:
             "degraded": 0,
             "critic_rejections": 0,
             "guard_blocked": 0,
+            "memory_facts": 0,
+            "profile_hits": 0,
+            "summaries": 0,
             "intents": {},
             "routing": {},
             "tool_calls": {},
@@ -239,6 +300,12 @@ class Tracer:
             m["degraded"] = m.get("degraded", 0) + 1
         if rec.reflections > 0:
             m["critic_rejections"] = m.get("critic_rejections", 0) + 1
+        if rec.memory_facts:
+            m["memory_facts"] = m.get("memory_facts", 0) + rec.memory_facts
+        if rec.profile_hit:
+            m["profile_hits"] = m.get("profile_hits", 0) + 1
+        if rec.summary_len:
+            m["summaries"] = m.get("summaries", 0) + 1
         m["intents"][rec.intent or "unknown"] = m["intents"].get(rec.intent or "unknown", 0) + 1
         m["routing"][rec.routing or "unknown"] = m["routing"].get(rec.routing or "unknown", 0) + 1
         for name in rec.tools:
@@ -288,6 +355,9 @@ class Tracer:
             f"降级兜底     : {s.get('degraded', 0)}",
             f"审核驳回     : {s.get('critic_rejections', 0)}",
             f"拦截注入     : {s.get('guard_blocked', 0)}",
+            f"记忆召回条数 : {s.get('memory_facts', 0)}",
+            f"画像命中次数 : {s.get('profile_hits', 0)}",
+            f"摘要压缩次数 : {s.get('summaries', 0)}",
             f"意图分布     : {s.get('intents', {})}",
             f"路由分布     : {s.get('routing', {})}",
             f"工具调用     : {s.get('tool_calls', {})}",

@@ -133,7 +133,8 @@ class KoiLive:
 flowchart LR
     START([START]) --> G["guard<br/>注入防护"]
     G -->|"命中注入 (block)"| F["finalize<br/>收敛"]
-    G -->|"放行 (allow)"| C["classify<br/>意图识别"]
+    G -->|"放行 (allow)"| R["recall<br/>记忆召回"]
+    R --> C["classify<br/>意图识别"]
     C -->|"no_reply"| F
     C -->|"price / tech / default"| A["agent<br/>专家推理"]
     A -->|"需要工具 且 未超步数"| T["tools<br/>ToolNode 执行"]
@@ -144,7 +145,12 @@ flowchart LR
     F --> E([END])
 ```
 
-**6 个节点，3 处条件边，2 处回边**（`tools→agent` 是 ReAct 循环，`critic→agent` 是 Reflexion 循环）。
+**7 个节点，3 处条件边，2 处回边**（`tools→agent` 是 ReAct 循环，`critic→agent` 是 Reflexion 循环）。
+
+> **写回不在图里**。记忆的**读**（召回）必须发生在生成之前，所以是图节点；
+> **写**（抽取事实 + 更新画像）不影响本轮回复，因此在 ``agenerate_reply`` 里
+> 用 ``asyncio.create_task`` 后台执行。这是一个有意的取舍，
+> 理由见 [决策 10](#决策-10把记忆拆成四层而不是一个-记忆列表)。
 
 ### 3.2 状态定义
 
@@ -168,6 +174,14 @@ class AgentState(TypedDict, total=False):
     reply: str             # 最终回复
     steps: int             # ReAct 已执行步数
     bargain_count: int     # 当前议价轮次
+    # ---- 记忆系统 ----
+    chat_id: str           # 会话标识（同时是 thread_id 与工具缓存的隔离维度）
+    user_id: str           # 买家标识（用户画像与长期记忆的维度）
+    summary: str           # 滑出窗口的历史对话的摘要（短期记忆）
+    summarized_count: int  # 已被摘要覆盖的消息条数（增量摘要边界，避免重复计费）
+    memory_text: str       # 渲染好的记忆文本（画像 + 长期记忆），直接注入 system prompt
+    memory_facts: int      # 本轮召回的长期记忆条数（可观测）
+    profile_hit: bool      # 是否命中用户画像（可观测）
 ```
 
 **两个关键点：**
@@ -397,12 +411,12 @@ def _safe_filter(text: str) -> str:
 
 | 条件边 | 判定函数 | 返回值 → 目标 |
 | --- | --- | --- |
-| `guard` 之后 | `_route_after_guard` | `guard_action == "block"` → `finalize`；否则 → `classify` |
+| `guard` 之后 | `_route_after_guard` | `guard_action == "block"` → `finalize`；否则 → `recall` |
 | `classify` 之后 | `_route_after_classify` | `intent == "no_reply"` → `finalize`；否则 → `agent` |
 | `agent` 之后 | `_route_after_agent` | 有 `tool_calls` 且 `steps < max_steps` → `tools`；否则 → `critic`（若启用）或 `finalize` |
 | `critic` 之后 | `_route_after_critic` | `approved` 或 `reflections > max` → `finalize`；否则 → `agent` |
 
-固定边：`START → guard`、`tools → agent`、`finalize → END`。
+固定边：`START → guard`、`recall → classify`、`tools → agent`、`finalize → END`。
 
 ### 3.5 为什么用 LangGraph，而不是自己写 if/else？
 
@@ -458,9 +472,21 @@ def generate_reply(self, ...):
 
 | 文件 | 职责 | 关键符号 |
 | --- | --- | --- |
-| `graph.py` | LangGraph 状态图、节点实现、路由、记忆、可观测埋点 | `KoiReplyBot`、`AgentState`、`IntentDecision`、`CritiqueResult`、`_build_graph`、`agenerate_reply` |
-| `tools.py` | Function Calling 工具定义 | `ALL_TOOLS`、`get_bargain_policy`、`search_knowledge_base`、`get_current_time` |
+| `graph.py` | LangGraph 状态图、节点实现、路由、记忆、可观测埋点 | `KoiReplyBot`、`AgentState`、`IntentDecision`、`CritiqueResult`、`_build_graph`、`_recall`、`agenerate_reply` |
+| `tools.py` | Function Calling 工具定义（接入工具记忆缓存与热更新） | `ALL_TOOLS`、`get_bargain_policy`、`search_knowledge_base`、`get_current_time` |
 | `guard.py` | 输入侧注入防护（4 层） | `normalize`、`harden`、`inspect`、`screen`、`GuardVerdict`、`_PATTERNS` |
+| `bargain.py` | 议价策略：JSON 配置驱动 + 热更新 | `BargainPolicy`、`get_bargain_policy_store`、`DEFAULT_POLICY` |
+
+### `koiagent/memory/` —— 记忆系统
+
+| 文件 | 职责 | 关键符号 |
+| --- | --- | --- |
+| `store.py` | SQLite 存储层（`memories` / `user_profiles` / `tool_calls` 三张表） | `MemoryStore`、`MemoryRecord` |
+| `short_term.py` | 短期记忆：窗口边界计算 + 增量摘要 | `ShortTermMemory`、`render_transcript` |
+| `long_term.py` | 长期记忆：抽取 / 召回打分 / 衰减淘汰 | `LongTermMemory`、`ExtractedMemory`、`fingerprint_of` |
+| `profile.py` | 用户画像：结构化属性 + 合并规则 | `UserProfile`、`ProfilePatch`、`ProfileStore` |
+| `tool_memory.py` | 工具记忆：会话级缓存 + 调用记录 | `ToolMemory`、`ToolCache`、`bind_chat_id`、`CACHEABLE_TOOLS` |
+| `manager.py` | 门面：统一读写接口与 LLM 注入 | `MemoryManager`、`MemoryContext`、`TurnInsight`、`get_memory_manager` |
 
 ### `koiagent/rag/` —— 检索增强层
 
@@ -481,8 +507,10 @@ def generate_reply(self, ...):
 
 | 文件 | 职责 | 关键符号 |
 | --- | --- | --- |
-| `observability.py` | 全链路追踪、指标聚合、Token/成本统计、Langfuse 接入 | `Tracer`、`TraceRecord`、`UsageCollector`、`estimate_cost`、`extract_usage` |
-| `resilience.py` | 幂等去重、熔断、并发限流、会话记忆治理 | `DedupCache`、`CircuitBreaker`、`ConcurrencyLimiter`、`ThreadReaper` |
+| `observability.py` | 全链路追踪（含文件轮转）、指标聚合、Token/成本统计、Langfuse 接入 | `Tracer`、`TraceRecord`、`UsageCollector`、`estimate_cost`、`extract_usage` |
+| `resilience.py` | 幂等去重、熔断、并发限流、会话记忆治理、**出站限速** | `DedupCache`、`CircuitBreaker`、`ConcurrencyLimiter`、`ThreadReaper`、`AsyncRateLimiter` |
+| `text.py` | 共享文本工具（被 rag 与 memory 共同引用，避免互相依赖） | `tokenize`、`l2_normalize`、`content_hash`、`keyword_overlap` |
+| `prompts.py` | 提示词加载（自定义 → 示例 → 内置默认） | `load_prompt` |
 
 ### 其他
 
@@ -490,19 +518,21 @@ def generate_reply(self, ...):
 | --- | --- | --- |
 | `app.py` | 应用装配：WebSocket 长连、心跳、Token 刷新、人工接管、消息分发、健康心跳文件 | `KoiLive` |
 | `storage/context.py` | SQLite 持久化：对话历史、议价轮次、商品信息缓存 | `ChatContextManager` |
-| `config.py` | `.env` 加载、日志初始化、缺失配置的交互式补全 | `load_env`、`setup_logging`、`check_and_complete_env`、`PLACEHOLDERS` |
+| `config.py` | `.env` 加载、日志初始化、**声明式 schema 校验**、缺失配置的交互式补全 | `load_env`、`setup_logging`、`validate_config`、`describe_config`、`check_and_complete_env`、`PLACEHOLDERS` |
 | `mcp/server.py` | MCP Server：把能力暴露给 Claude Desktop / Cursor 等客户端 | `server`、`ask_koi_agent`、`_load_env` |
 | `ops/healthcheck.py` | 容器健康检查：校验心跳文件新鲜度 | `main` |
-| `__main__.py` | CLI 入口：装配 → 常驻运行 → 优雅退出打印指标 | `main` |
+| `ops/order_events.py` | 订单事件钩子：待付款 / 交易关闭 / 待发货 | `OrderEvent`、`OrderEventKind`、`OrderEventHandler`、`resolve_order_event` |
+| `__main__.py` | CLI 入口：装配 → 常驻运行 → 优雅退出（等待后台记忆任务）打印指标 | `main`、`_run`、`_shutdown` |
 
 ### 项目级目录
 
 | 路径 | 作用 |
 | --- | --- |
 | `prompts/` | 提示词模板，`*_example.txt` 为默认值；建同名 `*.txt` 即可覆盖 |
-| `knowledge/` | RAG 知识库文档（`.md` / `.txt`），放入即被索引 |
+| `config/` | 业务配置文件（`bargain_policy.json` 议价策略，支持热更新） |
+| `knowledge/` | RAG 知识库文档（`.md` / `.txt`），放入即被索引（支持热更新） |
 | `eval/` | 评估 Harness + 测试集 JSON + 阈值门禁 |
-| `tests/` | 单元测试（99 项） |
+| `tests/` | 单元测试（200+ 项） |
 | `.github/workflows/ci.yml` | CI：编译校验 → 单元测试 → 评估门禁 → 上传报告 |
 
 ---
@@ -871,6 +901,268 @@ PLACEHOLDERS = {
 
 **代价（注意点）**：这两个占位符字符串**不能随便改**，否则判定失效。`koiagent/config.py` 与 `.env.example` 必须保持一致。
 
+### 决策 10：把记忆拆成四层，而不是一个「记忆列表」
+
+**问题**：Agent 要「记住东西」。最直觉的做法是维护一个消息列表，越攒越长。
+
+**为什么不行**：
+
+| 问题 | 现象 |
+| --- | --- |
+| **线性增长** | 第 50 轮时每次请求要带 50 轮历史，Token 成本线性上涨 |
+| **信息丢失** | 用 `[-N:]` 硬截断的话，早期信息**永久丢失**，买家会觉得「你刚才不是说过了吗」 |
+| **跨会话归零** | 买家三天后再来，一切从头开始 |
+| **问不出重点** | 历史里 90% 是寒暄，真正重要的「预算 500」「已答应包邮」淹没在噪声里 |
+
+**方案**：按「回答什么问题」拆成四层，各用各的存储与注入方式。
+
+| 记忆类型 | 回答什么问题 | 生命周期 | 注入方式 | 实现 |
+| --- | --- | --- | --- | --- |
+| **短期记忆** | 这段对话刚才说了什么？ | 单会话 | 摘要 + 原文窗口 | `memory/short_term.py` |
+| **长期记忆** | 这个买家历来是什么情况？ | 跨会话 | 按查询相关度召回 Top-K | `memory/long_term.py` |
+| **用户画像** | 这个买家是什么样的人？ | 跨会话 | 每轮**全量**注入 | `memory/profile.py` |
+| **工具记忆** | 这个工具刚才是怎么答的？ | 单会话 | **不进提示词**（纯省成本） | `memory/tool_memory.py` |
+
+**关键的子决策：**
+
+**① 短期记忆用「压缩」而不是「截断」，而且是增量压缩**
+
+```python
+def pending_range(self, total: int, summarized_count: int) -> Tuple[int, int]:
+    start = max(0, min(summarized_count, total))
+    end = self.boundary(total)      # = total - max_messages
+    return (start, end) if end > start else (0, 0)
+
+def should_summarize(self, total, summarized_count) -> bool:
+    start, end = self.pending_range(total, summarized_count)
+    return (end - start) >= self.trigger        # 累积满 trigger 条才付一次调用
+```
+
+**为什么不是每轮重新摘要整段历史**：那是 O(n²) 的成本增长，而且摘要的摘要会不断丢细节。增量方案下**每条消息只被摘要一次**，成本线性。
+
+**② 长期记忆与画像合并成一次 LLM 调用**
+
+两者读的是同一段对话、用的是同一类提示词。拆成两次调用意味着每轮多花一次钱。合并后用一个 `TurnInsight { memories, profile }` 的结构化输出一次拿全。
+
+**③ 用输入长度做廉价预过滤**
+
+```python
+@staticmethod
+def _should_extract(user_msg: str, min_len: int) -> bool:
+    return len((user_msg or "").strip()) >= min_len      # MEMORY_MIN_INPUT_LEN，默认 10
+```
+
+买家说「好的」「在吗」时直接跳过抽取。**客服从大量寒暄里省下的调用数是可观的** —— 而这类消息本来也抽不出任何值得记住的东西。
+
+**④ 读同步、写异步** —— 这是最重要的一条
+
+- **读**（召回）必须在生成之前完成 → 图里的 `recall` 节点。它是**纯本地 SQLite 查询**，无 LLM 调用。
+- **写**（抽取 + 落库）**完全不影响本轮回复** → 在 `agenerate_reply` 里 `asyncio.create_task` 后台执行。
+
+如果写回也放在图里，**买家要为一次与回复无关的 LLM 调用多等约 1 秒**。
+
+**两个必须处理的 asyncio 陷阱**：
+
+```python
+def _spawn_memory_task(self, payload):
+    task = asyncio.create_task(self.memory.remember(**payload))
+    self._background_tasks.add(task)                  # ① 必须持有引用
+    task.add_done_callback(self._background_tasks.discard)
+    task.add_done_callback(self._log_background_error)  # ② 必须消费异常
+```
+
+- **①**：`asyncio` 只对 task 持**弱引用**，不保存引用的话任务可能在执行完成前被 GC 回收
+- **②**：后台任务的异常不会自动冒泡，不显式消费只会留下一条 `never retrieved` 警告
+
+**退出时收尾**：`__main__.py` 在 `finally` 里 `await asyncio.shield(bot.aclose())`，避免进程退出丢掉最后一轮记忆。
+
+**⑤ 陈旧记忆的保护**
+
+记忆是「过去积累的判断」，可能与当下矛盾。提示词里明确要求：
+
+```
+【记忆使用要求】画像与历史记忆是**过往对话积累的判断**，可能与当前情况不符。
+若它们与买家刚刚说的话冲突，一律以买家当前的说法为准，
+不要拿旧信息反驳买家，也不要让买家察觉你在「查档案」。
+```
+
+**⑥ 被拦截的输入不写入记忆**
+
+```python
+if final.get("guard_action") != "block":
+    self._dispatch_memory_write(payload, ...)
+```
+
+否则攻击载荷会被**持久化到数据库**，影响以后所有对话。
+
+**⑦ 工具记忆是白名单制而不是黑名单制**
+
+```python
+CACHEABLE_TOOLS = {"search_knowledge_base", "get_bargain_policy"}
+```
+
+新工具**默认不缓存**。这是为了防止最典型的错误：把 `get_current_time` 也缓存了，于是它开始回答「现在 10:00」而实际是 11:30。
+
+**取舍（诚实说明）**：
+- 长期记忆靠**关键词相关性**召回，不是向量检索。规模小时够用，语义相近但用词不同的记忆会漏召回。
+- 抽取质量依赖模型。`weight` 打分和 `kind` 分类都可能不准，所以设计了**权重累积**（重复提及 → 权重 +0.5，上限 5.0）来放大真正重要的记忆。
+- 「记忆冲突消解」（同一个事实前后矛盾时该信哪个）目前**没做**，只做了「以买家当前说法为准」的提示词约束。
+
+### 决策 11：启动期配置校验，而不是运行到一半才崩
+
+**问题**：
+
+```python
+self.max_steps = int(os.getenv("AGENT_MAX_STEPS", "4"))
+```
+
+如果 `.env` 里写成 `AGENT_MAX_STEPS=abc`，`ValueError` 会在**构造 `KoiReplyBot` 时**抛出 —— 此时进程已经连上平台，甚至可能已经回过部分消息。
+
+**方案**：声明式 schema + 启动期一次性校验。
+
+```python
+CONFIG_SCHEMA: Dict[str, Tuple] = {
+    "AGENT_MAX_STEPS": (int, 1, 20, "4"),
+    "CIRCUIT_RESET_TIMEOUT": (float, 1, 86400, "60"),
+    "CRITIC_ENABLED": (bool, None, None, "true"),
+    ...
+}
+```
+
+三个能力：
+
+1. **类型 + 区间校验**：`AGENT_MAX_STEPS=999` 会被拒绝（超过上限 20）
+2. **未设置时回写默认值**：保证下游 `int()` 不会炸，同时让生效值可见
+3. **跨字段校验**：`RAG_CHUNK_OVERLAP >= RAG_CHUNK_SIZE` 会让切片无法前进，这是**语义错误而非格式错误**，单字段校验抓不到
+
+**警告与错误分开**：`MEMORY_REAP_INTERVAL` 不小于 `MEMORY_TTL` 只是「清理几乎不会触发」，记警告即可；而 `CRITIC_ENABLED=也许` 是无解的错误，`strict=True` 时直接抛异常终止启动。
+
+### 决策 12：追踪文件必须轮转
+
+**问题**：`_append_trace` 每轮对话追加一行，**从不轮转**。
+
+```python
+with open(self.trace_path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
+```
+
+按每行约 300 字节、每天 2000 轮算，一年约 220MB。看起来不多，但**磁盘写满时 `record()` 里的 `except` 会把它吞掉** —— 于是「可观测性失效」这件事本身**没有任何告警**，是最危险的那种静默故障。
+
+**方案**：写入前按大小检查并轮转。
+
+```python
+def _rotate_if_needed(self) -> None:
+    if self.trace_max_bytes <= 0 or not os.path.exists(self.trace_path):
+        return
+    if os.path.getsize(self.trace_path) < self.trace_max_bytes:
+        return
+    # 从最旧的备份开始顺移，丢弃超出 backup_count 的那份
+    ...
+```
+
+`TRACE_MAX_BYTES`（默认 10MB）+ `TRACE_BACKUP_COUNT`（默认 5）→ 磁盘占用上限约 60MB，可预测。设为 0 则关闭轮转。
+
+**同样的问题在 `metrics.json` 上却不适用**：`latency_samples` 有 `METRICS_SAMPLE_LIMIT` 上限，整个文件是**覆盖写**而不是追加，所以天然有界。**有界的追加日志才是需要轮转的那个。**
+
+### 决策 13：可热更新的配置，而不是改完就重启
+
+**问题**：议价策略硬编码在函数体里，知识库改了要重启进程。
+
+对电商客服来说这两件事**都需要频繁变更**：活动期间让价策略要调、临时加一条「618 大促说明」到知识库。每次改都要重启，意味着**一次掉线窗口**。
+
+**方案**：两套热更新，都基于**文件指纹 + 节流检查**。
+
+```python
+# 议价策略：mtime 检测
+def maybe_reload(self) -> bool:
+    now = time.time()
+    if now - self._last_check < self.reload_interval:   # 节流，默认 30s
+        return False
+    self._last_check = now
+    return self.reload(force=False)
+
+# 知识库：全目录指纹（路径 + mtime + 大小）
+def _compute_signature(self) -> str:
+    parts = [f"{rel}:{st.st_mtime_ns}:{st.st_size}" for ...]
+    return content_hash("|".join(parts))
+```
+
+**为什么要节流**：知识库的签名计算要 stat 整个目录。文档变多后每次检索都算一遍会有可观的系统调用开销，因此默认 30 秒检查一次。
+
+**一个容易写错的顺序问题**：
+
+```python
+if kb.maybe_reload():
+    get_memory_manager().on_knowledge_updated()
+return _tool_memory().invoke("search_knowledge_base", args, compute)
+```
+
+**热更新检查必须在缓存查询之前**。否则知识库已经改了，但缓存里还留着旧检索结果 —— 买家会拿到**过期信息**，而且这种错误很难排查（因为代码"看起来是对的"）。
+
+**议价策略用 JSON 文件而不是环境变量**：策略是多档结构（`max_round` / `max_discount_pct` / `guidance`），塞进环境变量会变成一坨难以维护的 JSON 字符串。用配置文件更自然，而且可以对它做结构校验（`_validate`），非法时**回退内置默认值**而不是崩溃。
+
+### 决策 14：订单事件用钩子而不是继续留空
+
+**问题**：
+
+```python
+# 判断是否为订单消息,需要自行编写付款后的逻辑
+if message['3']['redReminder'] == '等待买家付款':
+    logger.info(f'等待买家 {user_url} 付款')
+    return
+```
+
+三种订单状态只打日志就 `return`。**问题不在于"没写"，而在于没有扩展点** —— 想加「成交后引导评价」的人不知道该改哪一层。
+
+**方案**：文案解析 + 有默认行为的钩子。
+
+```python
+class OrderEventHandler:
+    def on_awaiting_payment(self, event): ...
+    def on_closed(self, event): ...
+    def on_awaiting_shipment(self, event): ...
+```
+
+默认实现**不是空的**，而是做「记录 + 写进 Agent 记忆 + 维护画像计数」这些确定该做的事。业务方继承并覆盖即可。
+
+**默认行为为什么不做「自动催付」「自动发货」**：这些动作涉及**真实资金与履约**，且各店铺流程差异极大。默认实现替用户做决定是不负责任的。**默认只做幂等、无副作用的记录，把有副作用的动作留给使用者显式实现。**
+
+一个有意思的默认行为：**交易关闭时清理工具缓存**。
+
+```python
+def on_closed(self, event):
+    self._remember(event, "【订单状态】本次交易已关闭。")
+    if self.memory is not None and event.chat_id:
+        self.memory.invalidate_session(event.chat_id)
+```
+
+因为之前查到的价格/库存信息此时可能已经失效，继续用缓存会导致机器人答错。
+
+### 决策 15：把「空壳」变成「有测试的分支」
+
+**问题**：`KoiLive.handle_message` 是**分支最多、最容易出 bug** 的地方 —— 它一个人负责 ACK 应答、消息解密、订单分流、时效过滤、幂等去重、卖家命令识别、人工接管判断、商品缓存、议价计数、模拟输入延迟。而它**原先完全没有测试覆盖**。
+
+**方案**：分两步。
+
+1. **先把可以脱离网络的部分抽出来测**：订单事件钩子、出站限速器、以及 `KoiLive` 上不依赖网络的方法（`format_price`、`build_item_description`、`is_chat_message` 等消息类型守卫、人工接管状态机、心跳文件写入、去重）。
+2. **为可测性补依赖注入**：`KoiLive.__init__(cookies_str, bot, order_handler=None, context_manager=None)` —— 测试可以塞入临时数据库，不污染真实业务库。
+
+**顺带发现的两个真实问题**：
+
+- `format_price(None)` 会 `TypeError`（已改为返回 `0.0`）
+- 消息类型守卫面对畸形消息（`None`、缺字段）必须返回 `False` 而不是抛异常 —— 这些都已用测试锁定
+
+**新增的出站限速器**：
+
+```python
+class AsyncRateLimiter:      # 令牌桶
+    def try_acquire(self) -> float:   # 返回还需等待的秒数，0 表示可立即执行
+```
+
+**为什么用令牌桶而不是固定间隔 sleep**：固定间隔会让正常场景也被拖慢。令牌桶允许**突发** —— 桶里攒着 `burst` 个令牌时前几条立即发出，用完后再按 `min_interval` 匀速补充。`SEND_MIN_INTERVAL=0` 时退化为不限速，保持向后兼容。
+
+**为什么需要它**：`ConcurrencyLimiter` 管的是 **LLM 推理并发**，管不住**发消息**。模型响应快时 Agent 可能连续发出多条消息，平台侧有风控。
+
 ---
 
 ## 6. 一次请求的完整生命周期
@@ -882,11 +1174,13 @@ sequenceDiagram
     participant P as 平台 WebSocket
     participant L as KoiLive (app.py)
     participant G as guard
+    participant R as recall
     participant C as classify
     participant A as agent
     participant T as ToolNode
     participant K as critic
     participant F as finalize
+    participant M as 记忆系统（后台）
 
     P->>L: 推送 syncPushPackage
     L->>L: ACK 应答
@@ -896,10 +1190,12 @@ sequenceDiagram
     L->>L: 取对话上下文 get_context_by_chat
     L->>G: agenerate_reply(state)
     Note over G: normalize → harden → inspect
-    G->>C: allow
+    G->>R: allow
+    Note over R: 短期摘要（增量触发）<br/>+ 长期记忆召回 + 画像（本地查询）
+    R->>C: memory_text 写入 state
     Note over C: 规则命中「便宜」→ price（0 次 LLM）
     C->>A: intent=price
-    Note over A: system prompt 拼入商品信息 + 议价轮次 + price 角色提示词
+    Note over A: system prompt 拼入商品信息 + 议价轮次 + 画像/记忆 + price 角色提示词
     A->>T: tool_calls=[get_bargain_policy(2)]
     T->>A: ToolMessage("次轮让价：累计不超过 10%...")
     A->>K: 草稿「亲，最多给您少 30 元」
@@ -910,8 +1206,11 @@ sequenceDiagram
     L->>L: 写 SQLite（用户消息 + 机器人回复）
     L->>L: last_intent=="price" → 议价次数 +1
     L->>L: 模拟人工输入延迟（可选）
+    L->>L: 出站限速 send_limiter.acquire()
     L->>P: sendByReceiverScope
     L->>L: 写 traces.jsonl + metrics.json
+    L--)M: 后台异步：抽取长期记忆 + 更新画像
+    Note over M: 不影响本轮回复<br/>退出时 aclose() 等待收尾
 ```
 
 **逐步说明**：
@@ -925,10 +1224,14 @@ sequenceDiagram
 7. **卖家消息分支**：如果是卖家（自己）发的——判断是否 TOGGLE 关键词（默认「。」）→ 切换人工接管模式；否则记录为 `assistant` 消息写入记忆（**这样机器人的后续回复能看到卖家的手动答复**）
 8. **人工接管检查**：处于接管模式的会话跳过自动回复，但消息仍写入上下文
 9. **商品信息**：优先读 SQLite 缓存，未命中才调 API 并回写。**为什么**：商品信息变化不频繁，每个会话都调 API 既慢又容易被限流
-10. **进入 Agent**：`await bot.agenerate_reply(...)` — 上面时序图的部分
+10. **进入 Agent**：`await bot.agenerate_reply(..., chat_id=..., user_id=...)` — 上面时序图的部分
+    - 先 `recall` 节点装配记忆（短期摘要 + 长期事实 + 画像），再进入意图识别与生成
+    - **被注入防护拦截的输入不会写入记忆**，避免攻击载荷被持久化
+    - 记忆的**读**在图内同步完成；**写**在回复之后作为后台任务执行
 11. **后处理**：`"-"` 直接返回不发送；否则记录上下文、`last_intent == "price"` 时议价次数 +1
-12. **发送**：可选模拟人工输入延迟（`SIMULATE_HUMAN_TYPING`，基础 0~1s + 每字 0.1~0.3s，上限 10s）
-13. **埋点**：写入 `logs/traces.jsonl` 与 `logs/metrics.json`
+12. **发送**：可选模拟人工输入延迟（`SIMULATE_HUMAN_TYPING`，基础 0~1s + 每字 0.1~0.3s，上限 10s），再过一道出站限速（`SEND_MIN_INTERVAL`）
+13. **埋点**：写入 `logs/traces.jsonl`（按大小轮转）与 `logs/metrics.json`，含记忆召回条数、画像命中、摘要次数
+14. **记忆写回**：后台任务从本轮对话中抽取长期事实 + 画像增量并落库
 
 **注意第 7 步的设计**：卖家人工回复也写进 Agent 记忆，是为了让机器人在接管解除后**知道刚才卖家已经答过了什么**，避免前后矛盾。
 
@@ -1036,19 +1339,22 @@ if failures:
 
 **离线可运行**：默认不需要任何 API Key（除 `--with-llm`），因为评测的是规则层和检索层。
 
-### 单元测试的覆盖范围（99 项）
+### 单元测试的覆盖范围（200+ 项）
 
 | 文件 | 覆盖内容 |
 | --- | --- |
-| `test_graph.py` | 状态图结构、节点路由、最终收敛 |
+| `test_graph.py` | 状态图结构、节点路由、记忆注入、后台任务收尾、议价策略配置化 |
 | `test_routing.py` | 规则路由的关键词/正则命中与优先级 |
 | `test_guard.py` | 归一化、加固、加权检测、分级、误伤控制 |
 | `test_tools_and_rag.py` | 工具输出、关键词检索、向量检索路径（注入假 Embedding） |
 | `test_resilience.py` | 去重 LRU+TTL、熔断状态机、并发限流、记忆淘汰 |
-| `test_observability.py` | 用量提取、成本估算、指标聚合、P95 |
+| `test_observability.py` | 用量提取、成本估算、指标聚合、P95、记忆指标、**追踪文件轮转** |
 | `test_agent_async.py` | 异步接口、同步封装在事件循环内的报错行为 |
 | `test_mcp_server.py` | MCP 工具注册与调用 |
-| `conftest.py` | 公共 fixture |
+| **`test_memory.py`** | **记忆系统**：存储去重与淘汰、摘要增量边界、召回打分、画像合并规则、工具缓存与会话隔离、门面读写 |
+| **`test_config.py`** | **配置校验**：类型/区间/布尔变体、跨字段校验、默认值回写、密钥脱敏 |
+| **`test_app_runtime.py`** | **运行时组件**：订单事件钩子、出站限速器、`KoiLive` 的纯逻辑（价格格式化、SKU 描述、消息类型守卫、人工接管状态机、心跳文件、去重） |
+| `conftest.py` | 公共 fixture（注入离线环境变量） |
 
 ### 一个值得记住的坑：测试中的确定性
 

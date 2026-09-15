@@ -101,3 +101,91 @@ def test_tracer_counts_degraded_runs(tmp_path):
     snapshot = tracer.snapshot()
     assert snapshot["degraded"] == 1
     assert snapshot["errors"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# 记忆相关指标
+# --------------------------------------------------------------------------- #
+def test_trace_record_has_memory_fields():
+    record = TraceRecord(ts="t", thread_id="c1")
+    assert record.memory_facts == 0
+    assert record.profile_hit is False
+    assert record.summary_len == 0
+
+
+def test_tracer_aggregates_memory_metrics(tmp_path):
+    tracer = Tracer(trace_dir=str(tmp_path), enabled=True)
+    tracer.record(
+        TraceRecord(
+            ts="t", thread_id="c1", memory_facts=3, profile_hit=True, summary_len=120
+        )
+    )
+    tracer.record(TraceRecord(ts="t", thread_id="c2", memory_facts=1))
+    snapshot = tracer.snapshot()
+    assert snapshot["memory_facts"] == 4
+    assert snapshot["profile_hits"] == 1
+    assert snapshot["summaries"] == 1
+
+
+def test_tracer_report_mentions_memory(tmp_path):
+    tracer = Tracer(trace_dir=str(tmp_path), enabled=True)
+    tracer.record(TraceRecord(ts="t", thread_id="c1", memory_facts=2, profile_hit=True))
+    report = tracer.format_report()
+    assert "记忆召回条数" in report
+    assert "画像命中次数" in report
+
+
+def test_metrics_file_backfills_missing_memory_counters(tmp_path):
+    """旧版本的 metrics.json 没有记忆字段，加载时必须补默认值而不是 KeyError。"""
+    (tmp_path / "metrics.json").write_text(
+        json.dumps({"total_runs": 1, "intents": {}, "routing": {}, "tool_calls": {}}),
+        encoding="utf-8",
+    )
+    tracer = Tracer(trace_dir=str(tmp_path), enabled=True)
+    snapshot = tracer.snapshot()
+    assert snapshot["memory_facts"] == 0
+    assert snapshot["profile_hits"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 追踪文件轮转（长跑防磁盘写满）
+# --------------------------------------------------------------------------- #
+def test_trace_file_rotates_when_exceeding_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRACE_MAX_BYTES", "200")
+    monkeypatch.setenv("TRACE_BACKUP_COUNT", "2")
+    tracer = Tracer(trace_dir=str(tmp_path), enabled=True)
+    assert tracer.trace_max_bytes == 200
+    assert tracer.trace_backup_count == 2
+
+    for i in range(50):
+        tracer.record(TraceRecord(ts=f"t{i}", thread_id=f"c{i}", intent="default"))
+
+    assert (tmp_path / "traces.jsonl").exists()
+    assert (tmp_path / "traces.jsonl.1").exists(), "应产生轮转备份"
+    # 备份数量不超过 backup_count
+    assert not (tmp_path / "traces.jsonl.3").exists()
+
+
+def test_trace_rotation_keeps_small_file_untouched(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRACE_MAX_BYTES", str(10 * 1024 * 1024))
+    tracer = Tracer(trace_dir=str(tmp_path), enabled=True)
+    tracer.record(TraceRecord(ts="t", thread_id="c1"))
+    assert not (tmp_path / "traces.jsonl.1").exists()
+
+
+def test_trace_rotation_with_zero_backups_truncates(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRACE_MAX_BYTES", "100")
+    monkeypatch.setenv("TRACE_BACKUP_COUNT", "0")
+    tracer = Tracer(trace_dir=str(tmp_path), enabled=True)
+    for i in range(30):
+        tracer.record(TraceRecord(ts=f"t{i}", thread_id="c1"))
+    assert not (tmp_path / "traces.jsonl.1").exists(), "backup_count=0 时不应产生备份"
+
+
+def test_trace_rotation_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRACE_MAX_BYTES", "0")
+    tracer = Tracer(trace_dir=str(tmp_path), enabled=True)
+    for i in range(20):
+        tracer.record(TraceRecord(ts=f"t{i}", thread_id="c1"))
+    assert not (tmp_path / "traces.jsonl.1").exists()
+

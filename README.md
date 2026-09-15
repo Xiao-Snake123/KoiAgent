@@ -17,13 +17,15 @@ KoiAgent 是一套面向电商平台客服场景的 **AI 值守解决方案**，
 | 模块     | 已实现                          | 规划中                         |
 | -------- | ------------------------------- | ------------------------------ |
 | 核心引擎 | ✅ LLM 自动回复<br>✅ 上下文管理 | 🔄 情感分析增强                 |
+| 记忆系统 | ✅ 短期摘要压缩<br>✅ 长期事实召回<br>✅ 用户画像<br>✅ 工具结果缓存 | 🔄 记忆冲突消解<br>🔄 记忆导入导出 |
 | 协作机制 | ✅ 专家路由<br>✅ 审核 Agent 反思重写 | 🔄 多专家辩论仲裁            |
 | 生态集成 | ✅ MCP Server（4 个能力）       | 🔄 更多 MCP 客户端适配         |
 | 安全防护 | ✅ Prompt 注入防护<br>✅ 站外联系拦截 | 🔄 敏感词库热更新              |
-| 议价系统 | ✅ 阶梯降价策略                  | 🔄 市场比价功能                 |
-| 技术支持 | ✅ RAG 知识库检索（向量/关键词） | 🔄 多模态问答                   |
-| 运维监控 | ✅ 全链路追踪<br>✅ 指标与成本统计<br>✅ 健康检查 | 🔄 钉钉告警<br>🔄 Web 管理台 |
-| 稳定性   | ✅ 幂等去重<br>✅ 熔断降级<br>✅ 并发限流 | 🔄 多实例部署<br>🔄 持久化记忆 |
+| 议价系统 | ✅ 阶梯降价策略（配置文件驱动 + 热更新） | 🔄 市场比价功能          |
+| 技术支持 | ✅ RAG 知识库检索（向量/关键词 + 热更新） | 🔄 多模态问答           |
+| 订单履约 | ✅ 订单事件钩子（待付款 / 关闭 / 待发货） | 🔄 自动发货提醒<br>🔄 评价引导 |
+| 运维监控 | ✅ 全链路追踪（含轮转）<br>✅ 指标与成本统计<br>✅ 启动期配置校验<br>✅ 健康检查 | 🔄 钉钉告警<br>🔄 Web 管理台 |
+| 稳定性   | ✅ 幂等去重<br>✅ 熔断降级<br>✅ 并发限流<br>✅ 出站限速 | 🔄 多实例部署<br>🔄 分布式记忆 |
 
 ## 🧠 Agent 架构
 
@@ -33,7 +35,8 @@ KoiAgent 是一套面向电商平台客服场景的 **AI 值守解决方案**，
 flowchart LR
     START([START]) --> G["guard<br/>注入防护"]
     G -->|"命中注入"| F["finalize<br/>收敛"]
-    G -->|"放行"| C["classify<br/>意图识别"]
+    G -->|"放行"| R["recall<br/>记忆召回"]
+    R --> C["classify<br/>意图识别"]
     C -->|"no_reply"| F
     C -->|"price / tech / default"| A["agent<br/>专家推理"]
     A -->|"需要工具"| T["tools<br/>工具执行"]
@@ -54,14 +57,18 @@ flowchart LR
 | ---- | ---- |
 | 状态图编排 | `langgraph` `StateGraph` + 条件边 |
 | 意图路由 | 关键词/正则规则优先 → LLM 结构化输出（Pydantic `IntentDecision`）兜底 |
+| **记忆系统** | 短期摘要压缩 + 长期事实召回 + 用户画像 + 工具结果缓存；写回后台异步执行 |
+| **可热更新配置** | 议价策略（JSON）与知识库（文件指纹检测）改动后无需重启 |
+| **配置校验** | 启动期声明式 schema 校验，配置填错 **启动即失败**（而非运行到一半才崩） |
 | 工具调用 | `bind_tools` + `ToolNode`，由模型自主调度 |
 | 知识检索 | RAG：Embedding（OpenAI 兼容）+ numpy 余弦检索；向量缓存落盘，未配置时降级关键词检索 |
 | ReAct 循环 | `agent ⇄ tools` 循环，`AGENT_MAX_STEPS` 上限保护 |
 | 多 Agent 协作 | 生产者-审核者（Producer-Critic）：独立审核 Agent 复核草稿，「驳回→带反馈重写」构成 **Reflexion 反思循环**，`AGENT_MAX_REFLECTIONS` 限制返工轮数 |
 | MCP 协议 | 以 `MCPServer` 暴露 4 个能力（3 个纯工具 + 完整 Agent 委派），支持 stdio / streamable-http |
 | 并发模型 | 全异步：节点 `ainvoke` + `graph.ainvoke`，LLM 请求不阻塞事件循环 |
-| 可靠性 | 幂等去重 / 熔断降级（失败返回兜底话术）/ 并发限流 / 会话记忆 TTL+LRU 淘汰 |
+| 可靠性 | 幂等去重 / 熔断降级（失败返回兜底话术）/ 并发限流 / 会话记忆 TTL+LRU 淘汰 / **出站限速** |
 | 对话记忆 | `MemorySaver` Checkpointer，`thread_id = chat_id` |
+| **记忆系统** | **四层记忆**：短期（窗口+摘要压缩）/ 长期（跨会话事实，按相关度召回）/ 用户画像（预算·意向·议价风格）/ 工具记忆（结果缓存 + 调用记录） |
 | 提示词 | 按意图动态装载 `prompts/*_example.txt` 专家角色提示词 |
 | 安全护栏 | **输入侧** Prompt 注入防护（归一化 + 加权规则 + 风险分级，命中直达拦截）；**输出侧**关键词过滤拦截站外联系方式 |
 | 可观测性 | 全链路 Trace + 指标聚合 + Token/成本统计，Callback 零侵入采集，可选 Langfuse |
@@ -82,6 +89,29 @@ flowchart LR
 | 熔断降级 | 连续失败达阈值即熔断，直接返回**兜底话术**而非静默无响应 |
 | 并发限流 | `asyncio.Semaphore` 限制同时推理数，平抑瞬时并发 |
 | 记忆治理 | Checkpointer 会话按 TTL + LRU 淘汰，防止长跑进程内存无限增长 |
+| 出站限速 | 令牌桶控制发送速率，防止模型响应过快导致连续发消息触发平台风控 |
+| 轨迹轮转 | `traces.jsonl` 按大小轮转，避免长跑进程写满磁盘后**静默失效** |
+
+## 🧩 记忆系统
+
+Agent 的记忆不是单一机制，而是四类职责不同的存储。它们回答的是**四个不同的问题**：
+
+| 记忆类型 | 回答什么问题 | 生命周期 | 注入方式 | 实现 |
+| -------- | ------------ | -------- | -------- | ---- |
+| **短期记忆** | 这段对话刚才说了什么？ | 单会话 | 摘要 + 原文窗口 | `memory/short_term.py` |
+| **长期记忆** | 这个买家历来是什么情况？ | 跨会话 | 按查询相关度召回 Top-K | `memory/long_term.py` |
+| **用户画像** | 这个买家是什么样的人？ | 跨会话 | 每轮全量注入 | `memory/profile.py` |
+| **工具记忆** | 这个工具刚才是怎么答的？ | 单会话 | 不进提示词（省成本） | `memory/tool_memory.py` |
+
+**几个关键设计点**
+
+- **摘要压缩而非硬截断**：滑出窗口的历史被 LLM 压成摘要（**增量累积**，每条消息只被摘要一次），而不是直接丢弃。
+- **读同步、写异步**：召回必须在生成前完成（本地 SQLite 查询，无 LLM 调用）；写入抽取是一次额外 LLM 调用，因此放到回复之后的**后台任务**，买家不必多等一秒。
+- **成本优化**：长期记忆与画像合并为**一次**抽取调用；短输入（如“好的”）直接跳过抽取；三次 LLM 调用被压成一次。
+- **陈旧记忆的保护**：提示词中明确要求「记忆与买家当前说法冲突时以当前说法为准」，避免拿旧信息反驳买家。
+- **注入不污染记忆**：被注入防护拦截的输入不会写入记忆，否则攻击载荷会被持久化。
+
+启停与调参：`MEMORY_ENABLED` 为总开关；`MEMORY_TOP_K` / `MEMORY_SUMMARY_TRIGGER` / `TOOL_MEMORY_TTL` 等见 `.env.example` 的「Agent 记忆系统」章节。
 
 ## 🎨 效果图
 <div align="center">
@@ -226,31 +256,44 @@ KoiAgent/
 │   ├── __init__.py               # 包元信息（__version__ / 分层说明）
 │   ├── __main__.py               # 入口：python -m koiagent
 │   ├── app.py                    # 应用装配：WebSocket 长连 / 心跳 / Token 刷新 / 人工接管
-│   ├── config.py                 # 配置加载 / 日志初始化 / 缺失配置交互式补全
+│   ├── config.py                 # 配置加载 / 声明式 schema 校验 / 缺失配置交互式补全
 │   ├── agent/                    # Agent 编排层
-│   │   ├── graph.py              #   LangGraph 状态图 guard→classify→agent⇄tools→critic
-│   │   ├── tools.py              #   Function Calling 工具集
-│   │   └── guard.py              #   输入侧 Prompt 注入防护
+│   │   ├── graph.py              #   LangGraph 状态图 guard→recall→classify→agent⇄tools→critic
+│   │   ├── tools.py              #   Function Calling 工具集（接入工具记忆缓存）
+│   │   ├── guard.py              #   输入侧 Prompt 注入防护
+│   │   └── bargain.py            #   议价策略（JSON 驱动 + 热更新）
+│   ├── memory/                   # 记忆系统
+│   │   ├── store.py              #   SQLite 存储层（memories / user_profiles / tool_calls）
+│   │   ├── short_term.py         #   短期记忆：窗口 + 增量摘要压缩
+│   │   ├── long_term.py          #   长期记忆：事实抽取 / 相关度召回 / 衰减淘汰
+│   │   ├── profile.py            #   用户画像：结构化属性 + 增量合并
+│   │   ├── tool_memory.py        #   工具记忆：会话级结果缓存 + 调用记录
+│   │   └── manager.py            #   门面：recall / remember / 上下文渲染
 │   ├── rag/
-│   │   └── knowledge.py          # RAG 检索层（向量 / 关键词双模式 + 向量缓存）
+│   │   └── knowledge.py          # RAG 检索层（向量 / 关键词双模式 + 缓存 + 热更新）
 │   ├── platform/
 │   │   ├── api.py                #   平台 HTTP 接口（登录 / Token / 商品）
 │   │   └── protocol.py           #   协议工具（Cookie / 签名 / MessagePack 解码）
 │   ├── infra/
-│   │   ├── observability.py      #   全链路 Trace / 指标聚合 / Token 与成本
-│   │   └── resilience.py         #   幂等去重 / 熔断 / 并发限流 / 记忆治理
+│   │   ├── observability.py      #   全链路 Trace（含轮转）/ 指标聚合 / Token 与成本
+│   │   ├── resilience.py         #   幂等去重 / 熔断 / 并发限流 / 记忆治理 / 出站限速
+│   │   ├── text.py               #   共享文本工具（分词 / 归一化 / 稳定哈希）
+│   │   └── prompts.py            #   提示词加载（自定义 → 示例 → 内置默认）
 │   ├── storage/
 │   │   └── context.py            #   SQLite 业务数据（议价次数 / 商品缓存）
 │   ├── mcp/
 │   │   └── server.py             #   MCP Server
 │   └── ops/
-│       └── healthcheck.py        #   容器健康检查
+│       ├── healthcheck.py        #   容器健康检查
+│       └── order_events.py       #   订单事件钩子（待付款 / 关闭 / 待发货）
 ├── main.py                       # 兼容入口（等价于 python -m koiagent）
+├── config/
+│   └── bargain_policy.json       # 议价阶梯策略（可改，热更新生效）
 ├── docs/                         # 设计文档
 │   ├── ARCHITECTURE.md           #   架构说明与设计决策
 │   └── INTERVIEW_QA.md           #   设计问答手册
 ├── knowledge/                    # 本地知识库（供 search_knowledge_base 检索）
-├── prompts/                      # 专家提示词模板
+├── prompts/                      # 提示词模板（专家角色 / 审核 / 记忆抽取）
 ├── eval/                         # 评估 Harness（评估集 + runner + 报告）
 ├── tests/                        # pytest 单元测试
 ├── .github/workflows/            # CI 流水线（编译 + 测试 + 评估门禁）

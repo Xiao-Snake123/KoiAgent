@@ -25,14 +25,16 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 from loguru import logger
+
+from koiagent.infra.text import content_hash, l2_normalize, tokenize
 
 try:  # 优先使用 LangChain 官方切分器
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -46,34 +48,14 @@ except ImportError:  # pragma: no cover - 无该依赖时走内置兜底切分
 # 工具函数
 # --------------------------------------------------------------------------- #
 def _hash(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+    """内容哈希（稳定，不依赖 PYTHONHASHSEED）。"""
+    return content_hash(text)
 
 
-def _tokenize(text: str) -> List[str]:
-    """中英文混合轻量分词：中文按 2-gram，英文/型号按空格切分并小写（保留连字符）。"""
-    text = re.sub(r"[^\w\u4e00-\u9fa5-]+", " ", text)
-    tokens: List[str] = []
-    for word in text.split():
-        word = word.strip("-")
-        if not word:
-            continue
-        if re.search(r"[\u4e00-\u9fa5]", word):
-            if len(word) <= 2:
-                tokens.append(word)
-            else:
-                tokens.extend(word[i:i + 2] for i in range(len(word) - 1))
-        else:
-            tokens.append(word.lower())
-    return tokens
-
-
-def _l2_normalize(matrix: Any) -> Any:
-    """L2 归一化，使点积等价于余弦相似度。"""
-    import numpy as np
-
-    norms = np.linalg.norm(matrix, axis=-1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return matrix / norms
+# 分词与归一化复用 infra.text 的共享实现：记忆检索需要同一套分词，
+# 放在下层各自引用可避免 rag 与 memory 互相依赖。
+_tokenize = tokenize
+_l2_normalize = l2_normalize
 
 
 # --------------------------------------------------------------------------- #
@@ -183,11 +165,54 @@ class KnowledgeBase:
         self.matrix: Optional[Any] = None  # numpy.ndarray, shape=(N, D)
         self.mode: str = "keyword"
 
+        # 热更新：按文件指纹（路径+mtime+大小）检测知识库变化，改动后无需重启
+        self.reload_interval = float(os.getenv("KB_RELOAD_INTERVAL", "30"))
+        self._last_check: float = 0.0
+        self._signature: str = ""
+
         self.reload()
 
     # ---------------- 构建 ----------------
+    def _compute_signature(self) -> str:
+        """知识库目录的指纹：所有 .md/.txt 的「相对路径 + mtime + 大小」哈希。"""
+        parts: List[str] = []
+        if os.path.isdir(self.kb_dir):
+            for root, _dirs, files in os.walk(self.kb_dir):
+                for name in sorted(files):
+                    if not name.lower().endswith((".md", ".txt")):
+                        continue
+                    path = os.path.join(root, name)
+                    try:
+                        stat = os.stat(path)
+                    except OSError:
+                        continue
+                    parts.append(f"{os.path.relpath(path, self.kb_dir)}:{stat.st_mtime_ns}:{stat.st_size}")
+        return content_hash("|".join(parts))
+
+    def maybe_reload(self) -> bool:
+        """按间隔节流地检查知识库变化，有变化则重建索引；返回是否重建了。
+
+        节流是必要的：每次检索都 stat 整个目录在文档变多后会有可观的系统调用开销，
+        默认 30 秒检查一次（``KB_RELOAD_INTERVAL``，设 0 关闭热更新）。
+        """
+        if self.reload_interval <= 0:
+            return False
+        now = time.time()
+        if now - self._last_check < self.reload_interval:
+            return False
+        self._last_check = now
+
+        signature = self._compute_signature()
+        if signature == self._signature:
+            return False
+
+        logger.info(f"检测到知识库变化，正在重建索引: {self.kb_dir}")
+        self.reload()
+        return True
+
     def reload(self) -> None:
         """重新加载并索引知识库。"""
+        self._signature = self._compute_signature()
         self.chunks = split_documents(
             load_documents(self.kb_dir), self.chunk_size, self.chunk_overlap
         )
